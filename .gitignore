@@ -1,0 +1,19 @@
+# Dependencias
+node_modules/
+
+# Archivos de entorno y logs
+.env
+.env.local
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# Archivos del sistema operativo
+.DS_Store
+Thumbs.db
+
+# Ignorar imágenes en input y output (mantiene carpetas vacías con .gitkeep)
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
