@@ -9,7 +9,7 @@ const OUTPUT_DIR = path.resolve('./output');
 
 // Extensiones de imágenes soportadas
 const SUPPORTED_EXTENSIONS = new Set([
-  '.jpg', '.jpeg', '.png', '.webp', '.avif', '.tiff', '.tif', '.gif', '.svg'
+  '.jpg', '.jpeg', '.png', '.webp', '.avif', '.heic', '.heif', '.tiff', '.tif', '.gif', '.svg'
 ]);
 
 // ANSI Colors para la consola
@@ -60,7 +60,25 @@ async function ensureDirExists(dirPath) {
 }
 
 /**
- * Optimiza una imagen en su formato original y crea la versión en WebP
+ * Limpia el contenido de la carpeta input manteniendo .gitkeep
+ */
+async function cleanInputDir() {
+  try {
+    const entries = await fs.readdir(INPUT_DIR);
+    for (const entry of entries) {
+      if (entry === '.gitkeep') continue;
+      const fullPath = path.join(INPUT_DIR, entry);
+      await fs.rm(fullPath, { recursive: true, force: true });
+    }
+    console.log(`🧹 Contenido de la carpeta '${colors.cyan}input/${colors.reset}' eliminado correctamente.\n`);
+  } catch (error) {
+    console.error(`  ${colors.red}❌ Error al limpiar la carpeta input:${colors.reset}`, error.message);
+  }
+}
+
+
+/**
+ * Convierte y optimiza una imagen a formato WebP en la carpeta output
  */
 async function processImage(filePath) {
   const ext = path.extname(filePath).toLowerCase();
@@ -79,66 +97,24 @@ async function processImage(filePath) {
   const originalSizeBytes = stats.size;
 
   const baseNameWithoutExt = path.basename(filePath, path.extname(filePath));
-  const targetOriginalPath = path.join(outputSubDir, `${baseNameWithoutExt}${ext}`);
   const targetWebpPath = path.join(outputSubDir, `${baseNameWithoutExt}.webp`);
 
   console.log(`\n${colors.cyan}📸 Procesando:${colors.reset} ${colors.bright}${relativePath}${colors.reset} (${formatBytes(originalSizeBytes)})`);
 
-  let originalSavedBytes = 0;
-  let webpSavedBytes = 0;
-
   try {
-    const imagePipeline = sharp(filePath, { animated: ext === '.gif' });
+    // Generar versión WebP optimizada
+    await sharp(filePath, { animated: ext === '.gif' })
+      .webp({ quality: 80, effort: 6 })
+      .toFile(targetWebpPath);
 
-    // 1. Optimizar en formato original
-    if (ext === '.jpg' || ext === '.jpeg') {
-      await sharp(filePath)
-        .jpeg({ quality: 80, mozjpeg: true, progressive: true })
-        .toFile(targetOriginalPath);
-    } else if (ext === '.png') {
-      await sharp(filePath)
-        .png({ quality: 80, compressionLevel: 9, palette: true })
-        .toFile(targetOriginalPath);
-    } else if (ext === '.webp') {
-      await sharp(filePath)
-        .webp({ quality: 80, effort: 6 })
-        .toFile(targetOriginalPath);
-    } else if (ext === '.avif') {
-      await sharp(filePath)
-        .avif({ quality: 75, effort: 6 })
-        .toFile(targetOriginalPath);
-    } else if (ext === '.gif') {
-      await sharp(filePath, { animated: true })
-        .gif({ colors: 256 })
-        .toFile(targetOriginalPath);
-    } else if (ext === '.svg') {
-      await fs.copyFile(filePath, targetOriginalPath);
-    } else {
-      await sharp(filePath).toFile(targetOriginalPath);
-    }
+    const webpStats = await fs.stat(targetWebpPath);
+    const webpSizeBytes = webpStats.size;
 
-    const origStats = await fs.stat(targetOriginalPath);
-    originalSavedBytes = origStats.size;
-    console.log(`  ${colors.green}✔ Formato original (${ext}):${colors.reset} ${formatBytes(origStats.size)} [Reducción: ${getSavingsPercent(originalSizeBytes, origStats.size)}]`);
-
-    // 2. Generar versión WebP optimizada (si el archivo no era ya .webp o si lo era, se genera igual la versión webp)
-    if (ext !== '.svg') {
-      await sharp(filePath, { animated: ext === '.gif' })
-        .webp({ quality: 80, effort: 6 })
-        .toFile(targetWebpPath);
-
-      const webpStats = await fs.stat(targetWebpPath);
-      webpSavedBytes = webpStats.size;
-      console.log(`  ${colors.magenta}🌐 Versión WebP (.webp):${colors.reset} ${formatBytes(webpStats.size)} [Reducción: ${getSavingsPercent(originalSizeBytes, webpStats.size)}]`);
-    } else {
-      // SVG se mantiene como SVG
-      webpSavedBytes = originalSavedBytes;
-    }
+    console.log(`  ${colors.magenta}🌐 Convertido a WebP (.webp):${colors.reset} ${formatBytes(webpSizeBytes)} [Reducción: ${getSavingsPercent(originalSizeBytes, webpSizeBytes)}]`);
 
     return {
       originalSizeBytes,
-      optOriginalSizeBytes: originalSavedBytes,
-      webpSizeBytes: webpSavedBytes
+      webpSizeBytes
     };
   } catch (error) {
     console.error(`  ${colors.red}❌ Error procesando ${relativePath}:${colors.reset}`, error.message);
@@ -150,7 +126,7 @@ async function processImage(filePath) {
  * Escanea recursivamente la carpeta input y procesa todas las imágenes existentes
  */
 async function processAllImages() {
-  console.log(`${colors.bright}${colors.blue}🚀 Iniciando optimización de imágenes...${colors.reset}`);
+  console.log(`${colors.bright}${colors.blue}🚀 Iniciando conversión de imágenes a WebP...${colors.reset}`);
   
   await ensureDirExists(INPUT_DIR);
   await ensureDirExists(OUTPUT_DIR);
@@ -189,7 +165,6 @@ async function processAllImages() {
   }
 
   let totalOriginal = 0;
-  let totalOptOriginal = 0;
   let totalWebp = 0;
   let processedCount = 0;
 
@@ -197,19 +172,19 @@ async function processAllImages() {
     const result = await processImage(file);
     if (result) {
       totalOriginal += result.originalSizeBytes;
-      totalOptOriginal += result.optOriginalSizeBytes;
       totalWebp += result.webpSizeBytes;
       processedCount++;
     }
   }
 
-  console.log(`\n${colors.bright}${colors.green}✨ ¡Optimización completada con éxito!${colors.reset}`);
+  console.log(`\n${colors.bright}${colors.green}✨ ¡Conversión a WebP completada con éxito!${colors.reset}`);
   console.log(`--------------------------------------------------`);
   console.log(`📊 Total de imágenes procesadas: ${colors.bright}${processedCount}${colors.reset}`);
   console.log(`📦 Peso total original:           ${formatBytes(totalOriginal)}`);
-  console.log(`⚡ Peso total (Formato Original):  ${formatBytes(totalOptOriginal)} (${getSavingsPercent(totalOriginal, totalOptOriginal)})`);
-  console.log(`🌐 Peso total (Formato WebP):      ${formatBytes(totalWebp)} (${getSavingsPercent(totalOriginal, totalWebp)})`);
+  console.log(`🌐 Peso total WebP:                ${formatBytes(totalWebp)} (${getSavingsPercent(totalOriginal, totalWebp)})`);
   console.log(`--------------------------------------------------\n`);
+
+  await cleanInputDir();
 }
 
 /**
@@ -235,7 +210,10 @@ async function startWatcher() {
   watcher.on('add', async (filePath) => {
     const ext = path.extname(filePath).toLowerCase();
     if (SUPPORTED_EXTENSIONS.has(ext)) {
-      await processImage(filePath);
+      const result = await processImage(filePath);
+      if (result) {
+        await fs.rm(filePath, { force: true });
+      }
     }
   });
 
@@ -243,7 +221,10 @@ async function startWatcher() {
     const ext = path.extname(filePath).toLowerCase();
     if (SUPPORTED_EXTENSIONS.has(ext)) {
       console.log(`\n${colors.yellow}🔄 Imagen modificada detectada: ${path.basename(filePath)}${colors.reset}`);
-      await processImage(filePath);
+      const result = await processImage(filePath);
+      if (result) {
+        await fs.rm(filePath, { force: true });
+      }
     }
   });
 }
