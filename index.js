@@ -3,13 +3,22 @@ import existsSync from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
 import chokidar from 'chokidar';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 const INPUT_DIR = path.resolve('./input');
 const OUTPUT_DIR = path.resolve('./output');
 
 // Extensiones de imágenes soportadas
-const SUPPORTED_EXTENSIONS = new Set([
+const SUPPORTED_IMAGE_EXTENSIONS = new Set([
   '.jpg', '.jpeg', '.png', '.webp', '.avif', '.heic', '.heif', '.tiff', '.tif', '.gif', '.svg'
+]);
+
+// Extensiones de video soportadas
+const SUPPORTED_VIDEO_EXTENSIONS = new Set([
+  '.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'
 ]);
 
 // ANSI Colors para la consola
@@ -53,7 +62,7 @@ function getSavingsPercent(original, newSize) {
 }
 
 /**
- * Asegura que los directorios base e carpetas secundarias existan
+ * Asegura que los directorios base o carpetas secundarias existan
  */
 async function ensureDirExists(dirPath) {
   await fs.mkdir(dirPath, { recursive: true });
@@ -76,6 +85,17 @@ async function cleanInputDir() {
   }
 }
 
+/**
+ * Comprueba si FFmpeg está instalado en el sistema
+ */
+async function checkFFmpegInstalled() {
+  try {
+    await execFileAsync('ffmpeg', ['-version']);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Convierte y optimiza una imagen a formato WebP en la carpeta output
@@ -84,8 +104,7 @@ async function processImage(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   const filename = path.basename(filePath);
 
-  // Ignorar archivos no soportados o archivos ocultos / .gitkeep
-  if (!SUPPORTED_EXTENSIONS.has(ext) || filename.startsWith('.')) {
+  if (!SUPPORTED_IMAGE_EXTENSIONS.has(ext) || filename.startsWith('.')) {
     return null;
   }
 
@@ -99,10 +118,9 @@ async function processImage(filePath) {
   const baseNameWithoutExt = path.basename(filePath, path.extname(filePath));
   const targetWebpPath = path.join(outputSubDir, `${baseNameWithoutExt}.webp`);
 
-  console.log(`\n${colors.cyan}📸 Procesando:${colors.reset} ${colors.bright}${relativePath}${colors.reset} (${formatBytes(originalSizeBytes)})`);
+  console.log(`\n${colors.cyan}📸 Procesando imagen:${colors.reset} ${colors.bright}${relativePath}${colors.reset} (${formatBytes(originalSizeBytes)})`);
 
   try {
-    // Generar versión WebP optimizada
     await sharp(filePath, { animated: ext === '.gif' })
       .webp({ quality: 80, effort: 6 })
       .toFile(targetWebpPath);
@@ -117,21 +135,100 @@ async function processImage(filePath) {
       webpSizeBytes
     };
   } catch (error) {
-    console.error(`  ${colors.red}❌ Error procesando ${relativePath}:${colors.reset}`, error.message);
+    console.error(`  ${colors.red}❌ Error procesando imagen ${relativePath}:${colors.reset}`, error.message);
     return null;
   }
 }
 
 /**
- * Escanea recursivamente la carpeta input y procesa todas las imágenes existentes
+ * Ejecuta FFmpeg mediante spawn en una Promesa
  */
-async function processAllImages() {
-  console.log(`${colors.bright}${colors.blue}🚀 Iniciando conversión de imágenes a WebP...${colors.reset}`);
+function runFFmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('ffmpeg', args);
+    let stderrData = '';
+
+    proc.stderr.on('data', (chunk) => {
+      stderrData += chunk.toString();
+    });
+
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`FFmpeg falló (código ${code}): ${stderrData.slice(-300)}`));
+      }
+    });
+
+    proc.on('error', (err) => {
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Optimiza un archivo de video a formato MP4 con compresión H.264/AAC
+ */
+async function processVideo(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const filename = path.basename(filePath);
+
+  if (!SUPPORTED_VIDEO_EXTENSIONS.has(ext) || filename.startsWith('.')) {
+    return null;
+  }
+
+  const relativePath = path.relative(INPUT_DIR, filePath);
+  const outputSubDir = path.dirname(path.join(OUTPUT_DIR, relativePath));
+  await ensureDirExists(outputSubDir);
+
+  const stats = await fs.stat(filePath);
+  const originalSizeBytes = stats.size;
+
+  const baseNameWithoutExt = path.basename(filePath, path.extname(filePath));
+  const targetMp4Path = path.join(outputSubDir, `${baseNameWithoutExt}.mp4`);
+
+  console.log(`\n${colors.cyan}🎬 Procesando video:${colors.reset} ${colors.bright}${relativePath}${colors.reset} (${formatBytes(originalSizeBytes)})`);
+
+  try {
+    const ffmpegArgs = [
+      '-i', filePath,
+      '-c:v', 'libx264',
+      '-crf', '26',
+      '-preset', 'fast',
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-movflags', '+faststart',
+      '-y',
+      targetMp4Path
+    ];
+
+    await runFFmpeg(ffmpegArgs);
+
+    const mp4Stats = await fs.stat(targetMp4Path);
+    const mp4SizeBytes = mp4Stats.size;
+
+    console.log(`  ${colors.magenta}📹 Video MP4 optimizado (.mp4):${colors.reset} ${formatBytes(mp4SizeBytes)} [Reducción: ${getSavingsPercent(originalSizeBytes, mp4SizeBytes)}]`);
+
+    return {
+      originalSizeBytes,
+      mp4SizeBytes
+    };
+  } catch (error) {
+    console.error(`  ${colors.red}❌ Error procesando video ${relativePath}:${colors.reset}`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Escanea recursivamente la carpeta input y procesa todas las imágenes y videos existentes
+ */
+async function processAllFiles() {
+  console.log(`${colors.bright}${colors.blue}🚀 Iniciando optimización de medios (imágenes y videos)...${colors.reset}`);
   
   await ensureDirExists(INPUT_DIR);
   await ensureDirExists(OUTPUT_DIR);
 
-  // Crear .gitkeep si la carpeta está vacía
   const inputGitkeep = path.join(INPUT_DIR, '.gitkeep');
   const outputGitkeep = path.join(OUTPUT_DIR, '.gitkeep');
   if (!existsSync.existsSync(inputGitkeep)) await fs.writeFile(inputGitkeep, '');
@@ -155,33 +252,75 @@ async function processAllImages() {
   const imageFiles = allFiles.filter(file => {
     const ext = path.extname(file).toLowerCase();
     const name = path.basename(file);
-    return SUPPORTED_EXTENSIONS.has(ext) && !name.startsWith('.');
+    return SUPPORTED_IMAGE_EXTENSIONS.has(ext) && !name.startsWith('.');
   });
 
-  if (imageFiles.length === 0) {
-    console.log(`\n${colors.yellow}⚠️ No se encontraron imágenes en la carpeta 'input/'.${colors.reset}`);
-    console.log(`Coloca tus imágenes en: ${colors.cyan}${INPUT_DIR}${colors.reset}\n`);
+  const videoFiles = allFiles.filter(file => {
+    const ext = path.extname(file).toLowerCase();
+    const name = path.basename(file);
+    return SUPPORTED_VIDEO_EXTENSIONS.has(ext) && !name.startsWith('.');
+  });
+
+  if (imageFiles.length === 0 && videoFiles.length === 0) {
+    console.log(`\n${colors.yellow}⚠️ No se encontraron imágenes ni videos soportados en la carpeta 'input/'.${colors.reset}`);
+    console.log(`Coloca tus archivos en: ${colors.cyan}${INPUT_DIR}${colors.reset}\n`);
     return;
   }
 
-  let totalOriginal = 0;
-  let totalWebp = 0;
-  let processedCount = 0;
-
-  for (const file of imageFiles) {
-    const result = await processImage(file);
-    if (result) {
-      totalOriginal += result.originalSizeBytes;
-      totalWebp += result.webpSizeBytes;
-      processedCount++;
+  let hasFFmpeg = true;
+  if (videoFiles.length > 0) {
+    hasFFmpeg = await checkFFmpegInstalled();
+    if (!hasFFmpeg) {
+      console.log(`\n${colors.red}⚠️ ADVERTENCIA: FFmpeg no se encuentra instalado o accesible en el PATH del sistema.${colors.reset}`);
+      console.log(`Se omitirá la optimización de los ${videoFiles.length} archivo(s) de video encontrados.\n`);
     }
   }
 
-  console.log(`\n${colors.bright}${colors.green}✨ ¡Conversión a WebP completada con éxito!${colors.reset}`);
+  let totalImageOriginal = 0;
+  let totalImageWebp = 0;
+  let processedImageCount = 0;
+
+  let totalVideoOriginal = 0;
+  let totalVideoMp4 = 0;
+  let processedVideoCount = 0;
+
+  // Procesar Imágenes
+  for (const file of imageFiles) {
+    const result = await processImage(file);
+    if (result) {
+      totalImageOriginal += result.originalSizeBytes;
+      totalImageWebp += result.webpSizeBytes;
+      processedImageCount++;
+    }
+  }
+
+  // Procesar Videos (si FFmpeg está disponible)
+  if (hasFFmpeg) {
+    for (const file of videoFiles) {
+      const result = await processVideo(file);
+      if (result) {
+        totalVideoOriginal += result.originalSizeBytes;
+        totalVideoMp4 += result.mp4SizeBytes;
+        processedVideoCount++;
+      }
+    }
+  }
+
+  const grandTotalOriginal = totalImageOriginal + totalVideoOriginal;
+  const grandTotalOptimized = totalImageWebp + totalVideoMp4;
+  const grandTotalProcessed = processedImageCount + processedVideoCount;
+
+  console.log(`\n${colors.bright}${colors.green}✨ ¡Proceso de optimización completado con éxito!${colors.reset}`);
   console.log(`--------------------------------------------------`);
-  console.log(`📊 Total de imágenes procesadas: ${colors.bright}${processedCount}${colors.reset}`);
-  console.log(`📦 Peso total original:           ${formatBytes(totalOriginal)}`);
-  console.log(`🌐 Peso total WebP:                ${formatBytes(totalWebp)} (${getSavingsPercent(totalOriginal, totalWebp)})`);
+  if (processedImageCount > 0) {
+    console.log(`🖼️ Imágenes procesadas:         ${colors.bright}${processedImageCount}${colors.reset} (${formatBytes(totalImageOriginal)} -> ${formatBytes(totalImageWebp)})`);
+  }
+  if (processedVideoCount > 0) {
+    console.log(`🎬 Videos procesados:           ${colors.bright}${processedVideoCount}${colors.reset} (${formatBytes(totalVideoOriginal)} -> ${formatBytes(totalVideoMp4)})`);
+  }
+  console.log(`📊 Archivos totales procesados: ${colors.bright}${grandTotalProcessed}${colors.reset}`);
+  console.log(`📦 Peso total original:           ${formatBytes(grandTotalOriginal)}`);
+  console.log(`🌐 Peso total optimizado:         ${formatBytes(grandTotalOptimized)} (${getSavingsPercent(grandTotalOriginal, grandTotalOptimized)})`);
   console.log(`--------------------------------------------------\n`);
 
   await cleanInputDir();
@@ -194,11 +333,17 @@ async function startWatcher() {
   await ensureDirExists(INPUT_DIR);
   await ensureDirExists(OUTPUT_DIR);
 
+  const hasFFmpeg = await checkFFmpegInstalled();
+
   console.log(`${colors.bright}${colors.blue}👀 Modo observación activo...${colors.reset}`);
-  console.log(`Esperando nuevas imágenes en ${colors.cyan}${INPUT_DIR}${colors.reset}\n`);
+  console.log(`Esperando nuevos archivos en ${colors.cyan}${INPUT_DIR}${colors.reset}`);
+  if (!hasFFmpeg) {
+    console.log(`${colors.yellow}⚠️ Nota: FFmpeg no está disponible. Solo se procesarán imágenes.${colors.reset}`);
+  }
+  console.log('');
 
   const watcher = chokidar.watch(INPUT_DIR, {
-    ignored: /(^|[\/\\])\../, // Ignorar archivos ocultos / .gitkeep
+    ignored: /(^|[\/\\])\../,
     persistent: true,
     ignoreInitial: false,
     awaitWriteFinish: {
@@ -207,26 +352,28 @@ async function startWatcher() {
     }
   });
 
-  watcher.on('add', async (filePath) => {
+  const handleFileChange = async (filePath) => {
     const ext = path.extname(filePath).toLowerCase();
-    if (SUPPORTED_EXTENSIONS.has(ext)) {
-      const result = await processImage(filePath);
-      if (result) {
-        await fs.rm(filePath, { force: true });
-      }
-    }
-  });
 
-  watcher.on('change', async (filePath) => {
-    const ext = path.extname(filePath).toLowerCase();
-    if (SUPPORTED_EXTENSIONS.has(ext)) {
-      console.log(`\n${colors.yellow}🔄 Imagen modificada detectada: ${path.basename(filePath)}${colors.reset}`);
+    if (SUPPORTED_IMAGE_EXTENSIONS.has(ext)) {
       const result = await processImage(filePath);
       if (result) {
         await fs.rm(filePath, { force: true });
       }
+    } else if (SUPPORTED_VIDEO_EXTENSIONS.has(ext)) {
+      if (!hasFFmpeg) {
+        console.log(`\n${colors.red}❌ No se puede procesar video ${path.basename(filePath)} porque FFmpeg no está instalado.${colors.reset}`);
+        return;
+      }
+      const result = await processVideo(filePath);
+      if (result) {
+        await fs.rm(filePath, { force: true });
+      }
     }
-  });
+  };
+
+  watcher.on('add', handleFileChange);
+  watcher.on('change', handleFileChange);
 }
 
 // Determinar modo por argumentos de linea de comandos
@@ -235,5 +382,6 @@ const isWatchMode = process.argv.includes('--watch') || process.argv.includes('-
 if (isWatchMode) {
   startWatcher();
 } else {
-  processAllImages();
+  processAllFiles();
 }
+
